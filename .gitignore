@@ -263,7 +263,6 @@ fabric.properties
 #zx
 
 # 确保排除数据集文件夹
-data/
 datasets/
 ga_cache/
 
