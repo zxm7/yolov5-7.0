@@ -1,121 +1,168 @@
 # ga_enhance/enhance_ops.py
 # =========================================================
-# ✅ 这里是“增强参数”的唯一权威
-# 你以后要：
-# - 改维度 DIM
-# - 改基因到真实参数的范围 decode_params()
-# - 改增强算法 apply_enhancement()
-# 都只改这一个文件即可。
-# ga_main / eval_yolo 都不会再维护重复的一套逻辑。
+# ✅ 完整版：DIM=6 (新增锐化权重 w_sharp 控制)
+# ✅ 包含：色彩校正 (Eq. 1-2)、多特征生成 (Eq. 3-4)、权重评估 (Eq. 5-6)、金字塔融合
 # =========================================================
 
 from __future__ import annotations
 from pathlib import Path
+import sys
 
 import cv2
 import numpy as np
 
-# -------------------------------
-# 1) 染色体维度（唯一权威）
-# -------------------------------
-DIM = 5
+# 🟢 容错处理：禁用 OpenCL
+try:
+    if hasattr(cv2, 'setUseOpenCL'):
+        cv2.setUseOpenCL(False)
+    elif hasattr(cv2, 'ocl') and hasattr(cv2.ocl, 'setUseOpenCL'):
+        cv2.ocl.setUseOpenCL(False)
+except Exception:
+    pass
+
+# 1. 维度改为 7
+DIM = 7
 
 def decode_params(chrom) -> dict:
-    """
-    将 GA 染色体 chrom（[0,1]^DIM）解码到真实增强参数（可解释参数）。
-
-    注意：
-    - chrom 必须长度等于 DIM
-    - 返回 dict，键名顺序也会影响 CSV 列顺序（建议固定）
-    """
     chrom = np.asarray(chrom, dtype=float).reshape(-1)
-    if len(chrom) != DIM:
-        raise ValueError(f"[decode_params] 期望维度 DIM={DIM}，但收到 len(chrom)={len(chrom)}")
-
-    g0, g1, g2, g3, g4 = chrom.tolist()
-
-    # 下面范围你可以随时改（论文/直觉/你自己实验）
-    # 只要改这里，整个项目会同步生效
-    bias     = -0.05 + 0.10 * g0           # [-0.05, 0.05]
-    gamma    =  0.90 + 0.30 * g1           # [0.90, 1.20]
-    contrast =  0.80 + 0.50 * g2           # [0.80, 1.30]
-    gain_r   =  0.85 + 0.35 * g3           # [0.85, 1.20]
-    gain_b   =  0.85 + 0.35 * g4           # [0.85, 1.20]
-
+    # 增加 g6 对应红光增益
+    g0, g1, g2, g3, g4, g5, g6 = chrom.tolist()
     return {
-        "bias": bias,
-        "gamma": gamma,
-        "contrast": contrast,
-        "gain_r": gain_r,
-        "gain_b": gain_b,
+        "eta1": g0,
+        "eta2": g1,
+        "gamma1": 0.8 + g2 * 3.0,
+        "gamma2": 1.0 + g3 * 2.0,
+        "gamma3": 1.0 + g4 * 2.0,
+        "w_sharp": g5,
+        "red_gain": 1.0 + g6 * 1.5   # 🟢 新增：红光增益范围 [1.0, 2.5]
     }
 
+
+# --- 金字塔融合辅助函数 (必须保留) ---
+
+def _get_gaussian_pyramid(img, levels):
+    pyramid = [img]
+    temp = img.copy()
+    for _ in range(levels - 1):
+        temp = cv2.pyrDown(temp)
+        pyramid.append(temp)
+    return pyramid
+
+
+def _get_laplacian_pyramid(img, levels):
+    gauss = _get_gaussian_pyramid(img, levels)
+    pyramid = []
+    for i in range(levels - 1):
+        size = (gauss[i].shape[1], gauss[i].shape[0])
+        expanded = cv2.pyrUp(gauss[i + 1], dstsize=size)
+        if expanded.shape != gauss[i].shape:
+            expanded = cv2.resize(expanded, (gauss[i].shape[1], gauss[i].shape[0]))
+        pyramid.append(gauss[i] - expanded)
+    pyramid.append(gauss[-1])
+    return pyramid
+
+
+# --- 主增强函数 ---
+
 def apply_enhancement(img_bgr: np.ndarray, params: dict) -> np.ndarray:
-    """
-    对单张图像执行增强（你要的“真实增强流程”）。
-
-    当前增强链路：
-    1) R/B 增益（对 BGR 的 R/B 通道做增益）
-    2) bias（整体加偏置）
-    3) contrast（围绕 0.5 做线性拉伸）
-    4) gamma（幂次变换）
-
-    你以后想加：
-    - CLAHE
-    - 去雾（dark channel / guided filter）
-    - 白平衡
-    都可以在这里扩展。只改这一处就行。
-    """
+    # 归一化输入
     img = img_bgr.astype(np.float32) / 255.0
 
-    # 1) R/B gain（注意 OpenCV 读入是 BGR）
-    gain_r = float(params["gain_r"])
-    gain_b = float(params["gain_b"])
-    img[..., 2] *= gain_r  # R
-    img[..., 0] *= gain_b  # B
+    # 🟢 新增：红色通道预补偿 (针对水下环境)
+    # 在 BGR 格式中，索引 2 是红色通道
+    r_gain = params.get("red_gain", 1.0)
+    img[..., 2] = np.clip(img[..., 2] * r_gain, 0.0, 1.0)
 
-    # 2) bias
-    bias = float(params["bias"])
-    img = img + bias
+    # 1. 色彩校正 (Color Correction Eq. 1-2) [cite: 106-109]
+    means = np.mean(img, axis=(0, 1))
+    idxs = np.argsort(means)
+    idx_low, idx_med, idx_high = idxs[0], idxs[1], idxs[2]
 
-    # 3) contrast around 0.5
-    c = float(params["contrast"])
-    img = (img - 0.5) * c + 0.5
+    # 保持之前验证过的温和补偿
+    eta1, eta2 = float(params["eta1"]) * 0.5, float(params["eta2"]) * 0.5
 
-    # 4) gamma
-    g = float(params["gamma"])
-    img = np.clip(img, 0.0, 1.0)
-    img = np.power(img, 1.0 / max(g, 1e-6))
+    img_corr = img.copy()
+    denom_med = (means[idx_high] + means[idx_med] + 1e-6)
+    img_corr[..., idx_med] += eta1 * ((means[idx_high] - means[idx_med]) / denom_med) * img[..., idx_high]
 
-    img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
-    return img
+    denom_low = (means[idx_high] + means[idx_low] + 1e-6)
+    img_corr[..., idx_low] += eta2 * ((means[idx_high] - means[idx_low]) / denom_low) * img[..., idx_high]
+
+    img_corr = np.clip(img_corr, 0.0, 1.0)
+
+    # 2. 多特征生成 (Multi-feature Generation Eq. 3-4) [cite: 123-127]
+    inputs = []
+
+    # 2.1 锐化图 I_s：由 GA 基因 w_sharp 控制强度
+    # 如果 GA 认为锐化伤害分数，它会把 w_s 搜向 0
+    w_s = params.get("w_sharp", 0.5)
+    blur = cv2.GaussianBlur(img_corr, (0, 0), 5)
+    details = img_corr - blur
+    d_min, d_max = details.min(), details.max()
+    details_norm = (details - d_min) / (d_max - d_min + 1e-6)
+    inputs.append(np.clip(img_corr * (1 - w_s) + details_norm * w_s, 0, 1))
+
+    # 2.2 3张 Gamma 曝光图
+    for k in ["gamma1", "gamma2", "gamma3"]:
+        inputs.append(np.power(img_corr, params[k]))
+
+    # 3. 权重评估 (Weighting Eq. 5-6) [cite: 133-134]
+    weights = []
+    sigma = 0.2
+    for inp in inputs:
+        gray = cv2.cvtColor((inp * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        # 曝光权重 (Exposure Map Eq. 5)
+        E = np.exp(-((gray - 0.5) ** 2) / (2 * sigma ** 2))
+        # 对比度权重 (Contrast Map Eq. 6)
+        C = np.abs(cv2.Laplacian(gray, cv2.CV_32F))
+        weights.append(E * C + 1e-6)
+
+    w_sum = np.sum(weights, axis=0)
+    norm_weights = [w / w_sum for w in weights]
+
+    # 4. 多尺度金字塔融合 (Pyramid Fusion Stage)
+    levels = 5
+    input_laps = [_get_laplacian_pyramid(inp, levels) for inp in inputs]
+    weight_gauss = [_get_gaussian_pyramid(w, levels) for w in norm_weights]
+
+    fused_pyramid = []
+    for l in range(levels):
+        fused_l = np.zeros_like(input_laps[0][l])
+        for i in range(len(inputs)):
+            fused_l += weight_gauss[i][l][..., np.newaxis] * input_laps[i][l]
+        fused_pyramid.append(fused_l)
+
+    # 重构图像
+    res = fused_pyramid[-1]
+    for l in range(levels - 2, -1, -1):
+        size = (fused_pyramid[l].shape[1], fused_pyramid[l].shape[0])
+        res = cv2.pyrUp(res, dstsize=size)
+        if res.shape != fused_pyramid[l].shape:
+            res = cv2.resize(res, (fused_pyramid[l].shape[1], fused_pyramid[l].shape[0]))
+        res += fused_pyramid[l]
+
+    return (np.clip(res, 0.0, 1.0) * 255.0).astype(np.uint8)
+
 
 def enhance_val_images(src_img_dir: Path, dst_img_dir: Path, params: dict, quiet: bool = True) -> int:
-    """
-    把 src_img_dir 下所有图片增强后写入 dst_img_dir（同名覆盖写）。
-
-    返回：
-        n_ok: 成功处理的图片数量
-    """
-    src_img_dir = Path(src_img_dir)
-    dst_img_dir = Path(dst_img_dir)
+    src_img_dir, dst_img_dir = Path(src_img_dir), Path(dst_img_dir)
     dst_img_dir.mkdir(parents=True, exist_ok=True)
+    img_paths = sorted([p for p in src_img_dir.glob("*") if p.suffix.lower() in [".jpg", ".jpeg", ".png"]])
 
-    img_paths = sorted([p for p in src_img_dir.glob("*")
-                        if p.suffix.lower() in [".jpg", ".jpeg", ".png"]])
-
+    total = len(img_paths)
     if not quiet:
-        print(f"[增强] 共找到 {len(img_paths)} 张图片，开始增强...")
+        print(f"\n[增强开始] 目标: {dst_img_dir.name}, 共 {total} 张")
 
     n_ok = 0
-    for p in img_paths:
-        img = cv2.imread(str(p), cv2.IMREAD_COLOR)
-        if img is None:
-            continue
+    for i, p in enumerate(img_paths, 1):
+        img = cv2.imread(str(p))
+        if img is None: continue
         out = apply_enhancement(img, params)
         cv2.imwrite(str(dst_img_dir / p.name), out)
         n_ok += 1
+        if not quiet and i % 10 == 0:
+            sys.stdout.write(f"\r >> 进度: {i}/{total} ({(i / total) * 100:.1f}%) ")
+            sys.stdout.flush()
 
-    if not quiet:
-        print(f"[增强] 完成：{n_ok}/{len(img_paths)} 张")
+    if not quiet: print(f"\n[完成] 成功处理 {n_ok} 张")
     return n_ok
