@@ -39,19 +39,19 @@ from .eval_yolo import evaluate_params, EvalResult, CACHE_DIR
 # -------------------------------
 # 0) GA 超参数（你可以调）
 # -------------------------------
-POP_SIZE = 8
-N_GEN = 5
-ELITE = 2               # 精英保留数量
+POP_SIZE = 50
+N_GEN = 30
+ELITE = 1               # 精英保留数量
 TOURNAMENT_K = 3        # 锦标赛选择规模
 CX_PROB = 0.8           # 交叉概率
-MUT_PROB = 0.3          # 变异概率
-MUT_SIGMA = 0.08        # 变异强度（对 [0,1] 空间加高斯噪声）
-SEED = 0
+MUT_PROB = 0.03          # 变异概率
+MUT_SIGMA = 0.15        # 变异强度（对 [0,1] 空间加高斯噪声）
+SEED = None
 
 # -------------------------------
 # 1) 并行设置（固定 2）
 # -------------------------------
-N_WORKERS = 1
+N_WORKERS = 12
 QUIET_ENHANCE = True    # 并行时建议 True：避免 2 个进程一起刷屏
 
 # -------------------------------
@@ -251,7 +251,8 @@ def main():
                     gen, idx_in_gen, gei, tag,
                     *[float(x) for x in chrom.tolist()],
                     *[float(params[c]) for c in param_cols],
-                    float(res.map50), float(res.time_sec),
+                    float(res.map50),
+                    float(res.time_sec),
                     int(res.ok), int(res.cache_hit), res.work_dir
                 ]
 
