@@ -64,7 +64,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 IMG_SIZE = 640
 CONF_THRES = 0.001      # ✅ mAP 评估通常使用 0.001（避免 invalid results）
 IOU_THRES = 0.6
-DEVICE = "0"            # 强制用 GPU：0
+DEVICE = ""            # 强制用 GPU：0
 YOLO_WORKERS = 0        # val.py 的 dataloader workers
 YOLO_BATCH_SIZE = 16     # 控制显存，防止 OOM
 YOLO_HALF = True
@@ -86,6 +86,7 @@ DEFAULT_VERBOSE = True           # True: 打印阶段信息
 class EvalResult:
     ok: int                 # 1成功 / 0失败
     map50: float            # 成功为 [0,1]，失败为 -1
+    map50_95: float  # 🟢 新增这行
     time_sec: float
     cache_hit: int          # 1=缓存命中 / 0=实际执行
     work_dir: str
