@@ -29,7 +29,9 @@ from pathlib import Path
 import torch
 from models.yolo import DetectionModel
 # 将 DetectionModel 加入安全加载名单
-torch.serialization.add_safe_globals([DetectionModel])
+# 增加一个判断，防止旧版本 PyTorch 报错
+if hasattr(torch.serialization, 'add_safe_globals'):
+    torch.serialization.add_safe_globals([DetectionModel])
 
 
 import numpy as np
